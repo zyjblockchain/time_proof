@@ -3,6 +3,7 @@ package client
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -44,7 +45,7 @@ type Packet struct {
 
 // Client 同步时间并进行修改系统时间
 func Client(measurements int) error {
-	diffs := make(durationSlice, 0, measurements)
+	diffs := make([]time.Duration, 0, measurements)
 
 	for i := 0; i < measurements+2; i++ {
 		conn, err := net.Dial("udp", host)
@@ -52,7 +53,6 @@ func Client(measurements int) error {
 			log.Fatalf("udp dial errorL: %v", err)
 			return err
 		}
-		defer conn.Close()
 
 		send := time.Now()
 		if err := conn.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
@@ -73,35 +73,51 @@ func Client(measurements int) error {
 			log.Fatalf("read socket error: %s", err)
 			return err
 		}
+		conn.Close()
 		elapsed := time.Since(send)
+		fmt.Println("传输时间：", elapsed.Nanoseconds())
 		/*
 			Unix 时间是一个开始于 1970 年的纪元（或者说从 1970 年开始的秒数）。
 			然而 NTP 使用的是另外一个纪元，从 1900 年开始的秒数。
 			因此，从 NTP 服务端获取到的值要正确地转成 Unix 时间必须减掉这 70 年间的秒数 (1970-1900)
 		*/
-		sec := int64(resp.TxTimeSec)                                                          // 秒数
-		frac := (int64(resp.TxTimeFrac) * 1e9) >> 32                                          // 纳秒位
+		sec := int64(resp.TxTimeSec)                 // 秒数
+		frac := (int64(resp.TxTimeFrac) * 1e9) >> 32 // 纳秒位
+		fmt.Println("纳秒：", frac)
 		nanosec := sec*1e9 + frac                                                             // 纳秒时间戳
 		tt := time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC).Add(time.Duration(nanosec)).Local() // 获得从1900年1月1日开始的纳秒时间戳
-		// standardTime := tt.Format("20060102 15:04:05.999999999")
-		// log.Println(standardTime)
+		standardTime := tt.Format("20060102 15:04:05.999999999")
+		log.Println("标准时间", standardTime)
+		log.Println("系统时间", time.Now().Format("20060102 15:04:05.999999999"))
+
 		// 时间差
+		// diffTime := send.UnixNano() - tt.UnixNano() + elapsed.Nanoseconds() / 2
 		diffTime := send.Sub(tt) + elapsed/2 // 与返回回来的时间差,本地时间 - 标准时间
-		diffs = append(diffs, diffTime)
+		fmt.Println(diffTime)
+		diffs = append(diffs, time.Duration(diffTime))
 	}
 	// 排序
-	sort.Sort(diffs)
+	sort.Sort(durationSlice(diffs))
 	// 去掉最高位和最低位求平均值
-	temp := time.Duration(0)
-	for i := 1; i < len(diffs)-1; i++ {
-		temp += diffs[i]
+	var finalDiff time.Duration = 0
+	temp := diffs[1]
+	for i := 2; i < len(diffs)-1; i++ {
+		next := temp + diffs[i]
+		if temp^next < 0 { // 符号相反，说明溢出了
+			finalDiff = diffs[1]
+			break
+		}
+		temp = next
 	}
-	finalDiff := temp / time.Duration(measurements)
 
+	if finalDiff == time.Duration(0) {
+		finalDiff = temp / time.Duration(measurements)
+	}
 	// 如果差值在允许的误差范围之内，则不用修改系统时间
 	if finalDiff > -driftThreshold && finalDiff < driftThreshold {
 		return nil
 	}
+	fmt.Println("相差时间22：", int64(finalDiff))
 	// 修改系统时间
 	if err := modifySysTime(int64(finalDiff)); err != nil {
 		return err
@@ -122,6 +138,7 @@ func modifySysTime(overTimestamp int64) error {
 	standardTimestamp := time.Now().UnixNano() - overTimestamp // 计算出标准时间戳
 	// 转换为系统设置时间的字符串类型
 	standardTime := time.Unix(0, standardTimestamp).Local().Format("20060102 15:04:05.999999999")
+	fmt.Println("待设置的时间：", standardTime)
 	cmd := exec.Command("date", "-s", standardTime)
 	cmd.Stdout = os.Stdout
 	if err := cmd.Run(); err != nil {
